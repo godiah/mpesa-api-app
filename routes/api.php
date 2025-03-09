@@ -10,15 +10,15 @@ Route::get('/user', function (Request $request) {
     return $request->user();
 })->middleware('auth:sanctum');
 
-Route::get('/mpesa-token', function(){
-    return (new MpesaService())->authorize();
+
+Route::prefix('mpesa')->group(function () {   
+    Route::post('/pay', [MpesaController::class, 'initiatePayment']);
+    Route::get('/status', [MpesaController::class, 'checkStatus']);
+
+    Route::post('/b2c/send', [MpesaController::class, 'initiateB2CPayment']);
+    Route::post('/b2c/queue', [MpesaController::class, 'queueTimeoutCallback'])->name('b2c.timeout');
+    Route::post('/b2c/result', [MpesaController::class, 'resultCallback'])->name('b2c.result');
 });
 
-Route::prefix('mpesa')->group(function () {
-    // Public callback URL
-    Route::post('callback', [MpesaController::class, 'handleCallback'])->name('stk.callback');
-    
-    // These could be protected with auth if needed
-    Route::post('pay', [MpesaController::class, 'initiatePayment']);
-    Route::get('status', [MpesaController::class, 'checkStatus']);
-});
+// Public callback URL
+Route::post('mpesa/callback', [MpesaController::class, 'handleCallback'])->name('stk.callback');

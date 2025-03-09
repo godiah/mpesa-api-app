@@ -2,7 +2,9 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Helpers\MpesaHelper;
 use App\Http\Controllers\Controller;
+use App\Models\MpesaB2CTransaction;
 use App\Models\MpesaTransaction;
 use App\Services\MpesaService;
 use Illuminate\Http\Request;
@@ -68,7 +70,7 @@ class MpesaController extends Controller
      */
     public function handleCallback(Request $request)
     {
-        // Log the entire callback for debugging
+        // Log the entire callback
         Log::info('M-PESA Callback: ' . json_encode($request->all()));
 
         $callbackData = $request->all();
@@ -229,6 +231,144 @@ class MpesaController extends Controller
     }
 
     /**
+     * Initiate B2C Payments
+     */
+    public function initiateB2CPayment(Request $request)
+    {
+        // Validate request
+        $validated = $request->validate([
+            'phone_number' => 'required|string',
+            'amount' => 'required|numeric|min:1',
+            'remarks' => 'required|string|max:100',
+            'occasion' => 'nullable|string|max:100',
+        ]);
+
+        // Format phone number
+        $phone = $this->formatPhoneNumber($validated['phone_number']);
+
+        try {
+            // Initiate B2C payment using M-PESA service
+
+            $response = $this->mpesaService->b2cPayment($phone, $validated['amount'], $validated['remarks'],$validated['occasion']);
+
+            // Create transaction record
+            MpesaB2CTransaction::create([
+                'originator_conversation_id' => $response['OriginatorConversationID'] ?? null,
+                'command_id' => $validated['command_id'] ?? 'BusinessPayment',
+                'initiator_name' => env('MPESA_INITIATOR_NAME'),
+                'phone_number' => $phone,
+                'amount' => $validated['amount'],
+                'remarks' => $validated['remarks'],
+                'occasion' => $validated['occasion'] ?? '',
+                'status' => 'pending',
+                'conversation_id' => $response['ConversationID'] ?? null,
+                'result_code' => $response['ResponseCode'] ?? null,
+                'result_description' => $response['ResponseDescription'] ?? null,
+                'result_data' => $response,
+                'request_data' => [
+                    'phone_number' => $validated['phone_number'],
+                    'amount' => $validated['amount'],
+                    'remarks' => $validated['remarks'],
+                    'occasion' => $validated['occasion'] ?? '',
+                    'command_id' => $validated['command_id'] ?? 'BusinessPayment',
+                ],
+            ]);
+            
+            return response()->json([
+                'success' => true,
+                'message' => 'Payment request accepted for processing',
+                'data' => $response
+            ]);
+        } catch (\Exception $e) {
+            Log::error('B2C payment failed', [
+                'error' => $e->getMessage(),
+                'request' => $request->all()
+            ]);
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Payment request failed',
+                'error' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     *  Handles callbacks when M-Pesa can't process your request within the expected timeframe. 
+     *  It's a fallback mechanism.
+     */
+    public function queueTimeoutCallback(Request $request)
+    {
+        Log::info('M-Pesa B2C Queue Timeout', $request->all());
+        
+        // Process timeout notification
+        $this->processCallback($request->all());
+        
+        return response()->json(['ResultCode' => 0, 'ResultDesc' => 'Accepted']);
+    }
+
+    /**
+     * Handles callback from M-Pesa when a B2C transaction is completed (successfully or with failure)
+     */
+    public function resultCallback(Request $request)
+    {
+        Log::info('M-Pesa B2C Result', $request->all());
+        
+        // Process result notification
+        $this->processCallback($request->all());
+        
+        return response()->json(['ResultCode' => 0, 'ResultDesc' => 'Accepted']);
+    }
+    
+    /** 
+     * Processes data from both types of callbacks[result&queueTimeout], avoiding code duplication.
+    */
+    protected function processCallback($data)
+    {
+        // Find transaction by OriginatorConversationID
+        $originatorConversationId = MpesaHelper::getOriginatorConversationID($data);
+        if (!$originatorConversationId) {
+            Log::warning("Cannot process callback: missing OriginatorConversationID");            
+            return;
+        }
+
+        $transaction = MpesaB2CTransaction::where('originator_conversation_id', $originatorConversationId)
+            ->first();
+        
+        if (!$transaction) {
+            Log::warning('M-Pesa B2C transaction not found', $data);
+
+            // Dispatch job to reattempt processing later
+            \App\Jobs\ProcessMpesaCallback::dispatch($data);
+            return;
+        }
+
+        // Check for duplicate processing
+        if (in_array($transaction->status, ['completed', 'failed'])) {
+            Log::info('Duplicate callback received for transaction: ' . $transaction->originator_conversation_id);
+            return;
+        }
+        
+        // Update transaction details
+        $transaction->update([
+            'conversation_id' => $data['ConversationID'] ?? null,
+            'result_code' => $data['ResultCode'] ?? null,
+            'result_description' => $data['ResultDesc'] ?? null,
+            'status' => ($data['ResultCode'] ?? 1) == 0 ? 'completed' : 'failed',
+            'result_data' => $data,
+        ]);
+        
+        // Process additional business logic based on the result
+        if (($data['ResultCode'] ?? 1) == 0) {
+            // Payment was successful - trigger any necessary business logic
+            // e.g., update order status, send notification, etc.
+        } else {
+            // Payment failed - handle the failure
+            // e.g., notify admin, retry policy, etc.
+        }
+    }
+
+    /**
      * Format phone number to required format (254XXXXXXXXX)
      */
     private function formatPhoneNumber($phone)
@@ -248,4 +388,23 @@ class MpesaController extends Controller
 
         return $phone;
     }
+
+    /**
+     * Helper method to extract key field OriginatorConversationID by checking multiple possible locations in the data structure. 
+     */
+    protected function getOriginatorConversationID(array $data)
+    {
+        // Check if it exists in the nested "Result" object first
+        if (isset($data['Result']['OriginatorConversationID'])) {
+            return $data['Result']['OriginatorConversationID'];
+        }
+        // Fallback: check for a top-level key
+        if (isset($data['OriginatorConversationID'])) {
+            return $data['OriginatorConversationID'];
+        }
+        // Log the issue and return null if not found
+        Log::warning("OriginatorConversationID not found in callback data: " . json_encode($data));
+        return null;
+    }
+
 }
