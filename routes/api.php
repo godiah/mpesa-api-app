@@ -11,7 +11,7 @@ Route::get('/user', function (Request $request) {
 })->middleware('auth:sanctum');
 
 
-Route::prefix('mpesa')->group(function () {   
+Route::prefix('mpesa')->group(function () {
     Route::post('/pay', [MpesaController::class, 'initiatePayment']);
     Route::get('/status', [MpesaController::class, 'checkStatus']);
 

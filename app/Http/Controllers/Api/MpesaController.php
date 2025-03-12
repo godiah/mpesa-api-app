@@ -8,6 +8,7 @@ use App\Models\MpesaB2CTransaction;
 use App\Models\MpesaTransaction;
 use App\Services\MpesaService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
 class MpesaController extends Controller
@@ -39,6 +40,12 @@ class MpesaController extends Controller
             // Initiate STK Push
             $response = $this->mpesaService->stkPush($phone, $reference, $validated['amount']);
 
+            Log::info('Detailed STK Push Response', [
+                'raw_response' => $response,
+                'merchant_request_id' => $response['MerchantRequestID'] ?? 'NOT FOUND',
+                'checkout_request_id' => $response['CheckoutRequestID'] ?? 'NOT FOUND'
+            ]);
+
             // Create transaction record
             MpesaTransaction::create([
                 'phone' => $phone,
@@ -56,7 +63,7 @@ class MpesaController extends Controller
             ]);
         } catch (\Exception $e) {
             Log::error('M-PESA Payment Error: ' . $e->getMessage());
-            
+
             return response()->json([
                 'success' => false,
                 'message' => 'Failed to initiate payment',
@@ -71,69 +78,140 @@ class MpesaController extends Controller
     public function handleCallback(Request $request)
     {
         // Log the entire callback
-        Log::info('M-PESA Callback: ' . json_encode($request->all()));
+        Log::info('M-PESA Callback Received', ['data' => $request->all()]);
 
-        $callbackData = $request->all();
-        
-        // Extract the callback body
-        $callbackBody = $callbackData['Body'] ?? null;
-        
-        if (!$callbackBody) {
-            return response()->json(['ResultCode' => 1, 'ResultDesc' => 'Invalid callback data']);
-        }
+        try {
+            $callbackData = $request->all();
+            $callbackBody = $callbackData['Body'] ?? null;
 
-        $stkCallback = $callbackBody['stkCallback'] ?? null;
-        $resultCode = $stkCallback['ResultCode'] ?? null;
-        $merchantRequestID = $stkCallback['MerchantRequestID'] ?? null;
-        $checkoutRequestID = $stkCallback['CheckoutRequestID'] ?? null;
+            if (!$callbackBody) {
+                Log::error('Invalid callback data - missing Body', ['callback' => $callbackData]);
+                return response()->json(['ResultCode' => 1, 'ResultDesc' => 'Invalid callback data']);
+            }
 
-        // Find the transaction
-        $transaction = MpesaTransaction::where('checkout_request_id', $checkoutRequestID)->first();
-        
-        if (!$transaction) {
-            Log::error('Transaction not found for checkout_request_id: ' . $checkoutRequestID);
-            return response()->json(['ResultCode' => 1, 'ResultDesc' => 'Transaction not found']);
-        }
+            $stkCallback = $callbackBody['stkCallback'] ?? null;
+            if (!$stkCallback) {
+                Log::error('Invalid callback data - missing stkCallback', ['body' => $callbackBody]);
+                return response()->json(['ResultCode' => 1, 'ResultDesc' => 'Invalid stkCallback data']);
+            }
 
-        // If payment was successful
-        if ($resultCode == 0) {
-            // Extract payment details from CallbackMetadata
-            $metadata = $stkCallback['CallbackMetadata']['Item'] ?? [];
-            $receiptNumber = null;
-            $transactionDate = null;
-            
-            foreach ($metadata as $item) {
-                if ($item['Name'] == 'MpesaReceiptNumber') {
-                    $receiptNumber = $item['Value'];
-                }
-                if ($item['Name'] == 'TransactionDate') {
-                    $transactionDate = $item['Value'];
+            $resultCode = $stkCallback['ResultCode'] ?? null;
+            $merchantRequestID = $stkCallback['MerchantRequestID'] ?? null;
+            $checkoutRequestID = $stkCallback['CheckoutRequestID'] ?? null;
+
+            if (!$merchantRequestID || !$checkoutRequestID) {
+                Log::error('Missing request IDs in callback', ['stkCallback' => $stkCallback]);
+                return response()->json(['ResultCode' => 1, 'ResultDesc' => 'Missing request IDs']);
+            }
+
+            // Find the transaction
+            $transaction = MpesaTransaction::where('checkout_request_id', $checkoutRequestID)->first();
+
+            if (!$transaction) {
+                Log::error('Transaction not found for checkout_request_id', [
+                    'checkout_request_id' => $checkoutRequestID,
+                    'merchant_request_id' => $merchantRequestID
+                ]);
+
+                // Try to find by merchant request ID as fallback
+                $transaction = MpesaTransaction::where('merchant_request_id', $merchantRequestID)->first();
+
+                if (!$transaction) {
+                    return response()->json(['ResultCode' => 1, 'ResultDesc' => 'Transaction not found']);
                 }
             }
-            
-            // Update transaction
-            $transaction->update([
-                'mpesa_receipt_number' => $receiptNumber,
-                'transaction_date' => $transactionDate,
-                'result_code' => $resultCode,
-                'result_desc' => $stkCallback['ResultDesc'] ?? 'Success',
-                'status' => 'completed',
-            ]);
-            
-            Log::info('Payment successful for: ' . $transaction->reference);
-        } else {
-            // Update transaction as failed
-            $transaction->update([
-                'result_code' => $resultCode,
-                'result_desc' => $stkCallback['ResultDesc'] ?? 'Failed',
-                'status' => 'failed',
-            ]);
-            
-            Log::error('Payment failed for: ' . $transaction->reference . ' with error: ' . ($stkCallback['ResultDesc'] ?? 'Unknown error'));
-        }
 
-        // Always respond with success to M-PESA (this doesn't mean the payment succeeded, just that we processed the callback)
-        return response()->json(['ResultCode' => 0, 'ResultDesc' => 'Callback received successfully']);
+            Log::info('Transaction found', [
+                'transaction_id' => $transaction->id,
+                'order_id' => $transaction->order_id,
+                'result_code' => $resultCode
+            ]);
+
+            // Process the payment result
+            if ($resultCode == 0) {
+                // Extract payment details from callback metadata
+                $callbackMetadata = $stkCallback['CallbackMetadata']['Item'] ?? [];
+                $mpesaReceiptNumber = null;
+                $transactionDate = null;
+                $phoneNumber = null;
+                $amount = null;
+
+                // Parse the callback metadata items
+                foreach ($callbackMetadata as $item) {
+                    if ($item['Name'] == 'MpesaReceiptNumber') {
+                        $mpesaReceiptNumber = $item['Value'] ?? null;
+                    } else if ($item['Name'] == 'TransactionDate') {
+                        $transactionDate = $item['Value'] ?? null;
+                    } else if ($item['Name'] == 'PhoneNumber') {
+                        $phoneNumber = $item['Value'] ?? null;
+                    } else if ($item['Name'] == 'Amount') {
+                        $amount = $item['Value'] ?? null;
+                    }
+                }
+
+                // Update transaction with payment details
+                $transaction->update([
+                    'mpesa_receipt_number' => $mpesaReceiptNumber,
+                    'transaction_date' => $transactionDate,
+                    'status' => 'completed',
+                    'result_code' => $resultCode,
+                    'result_desc' => $stkCallback['ResultDesc'] ?? 'Success'
+                ]);
+
+                // Notify the e-shop application about the payment
+                $this->notifyEshop($transaction);
+            } else {
+                // Payment failed
+                $transaction->update([
+                    'status' => 'failed',
+                    'result_code' => $resultCode,
+                    'result_desc' => $stkCallback['ResultDesc'] ?? 'Failed'
+                ]);
+
+                // Notify the e-shop application about the failure
+                $this->notifyEshop($transaction);
+            }
+
+            // Always respond with success to M-PESA
+            return response()->json(['ResultCode' => 0, 'ResultDesc' => 'Callback received successfully']);
+        } catch (\Exception $e) {
+            Log::error('Exception in M-PESA callback handler', [
+                'message' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+
+            return response()->json(['ResultCode' => 1, 'ResultDesc' => 'Error processing callback']);
+        }
+    }
+
+    /**
+     * Notify the e-shop application about the payment status
+     */
+    private function notifyEshop($transaction)
+    {
+        try {
+            // Make a request to the e-shop's webhook endpoint
+            $response = Http::post('http://localhost:5000/api/mpesa/webhook', [
+                'reference' => $transaction->reference,
+                'merchant_request_id' => $transaction->merchant_request_id,
+                'checkout_request_id' => $transaction->checkout_request_id,
+                'mpesa_receipt_number' => $transaction->mpesa_receipt_number,
+                'transaction_date' => $transaction->transaction_date,
+                'status' => $transaction->status,
+                'result_code' => $transaction->result_code,
+                'result_desc' => $transaction->result_desc,
+            ]);
+
+            Log::info('E-shop notification response', [
+                'status' => $response->status(),
+                'body' => $response->json()
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to notify e-shop', [
+                'error' => $e->getMessage(),
+                'transaction' => $transaction->id
+            ]);
+        }
     }
 
     /**
@@ -249,7 +327,7 @@ class MpesaController extends Controller
         try {
             // Initiate B2C payment using M-PESA service
 
-            $response = $this->mpesaService->b2cPayment($phone, $validated['amount'], $validated['remarks'],$validated['occasion']);
+            $response = $this->mpesaService->b2cPayment($phone, $validated['amount'], $validated['remarks'], $validated['occasion']);
 
             // Create transaction record
             MpesaB2CTransaction::create([
@@ -273,7 +351,7 @@ class MpesaController extends Controller
                     'command_id' => $validated['command_id'] ?? 'BusinessPayment',
                 ],
             ]);
-            
+
             return response()->json([
                 'success' => true,
                 'message' => 'Payment request accepted for processing',
@@ -284,7 +362,7 @@ class MpesaController extends Controller
                 'error' => $e->getMessage(),
                 'request' => $request->all()
             ]);
-            
+
             return response()->json([
                 'success' => false,
                 'message' => 'Payment request failed',
@@ -300,10 +378,10 @@ class MpesaController extends Controller
     public function queueTimeoutCallback(Request $request)
     {
         Log::info('M-Pesa B2C Queue Timeout', $request->all());
-        
+
         // Process timeout notification
         $this->processCallback($request->all());
-        
+
         return response()->json(['ResultCode' => 0, 'ResultDesc' => 'Accepted']);
     }
 
@@ -313,28 +391,28 @@ class MpesaController extends Controller
     public function resultCallback(Request $request)
     {
         Log::info('M-Pesa B2C Result', $request->all());
-        
+
         // Process result notification
         $this->processCallback($request->all());
-        
+
         return response()->json(['ResultCode' => 0, 'ResultDesc' => 'Accepted']);
     }
-    
+
     /** 
      * Processes data from both types of callbacks[result&queueTimeout], avoiding code duplication.
-    */
+     */
     protected function processCallback($data)
     {
         // Find transaction by OriginatorConversationID
         $originatorConversationId = MpesaHelper::getOriginatorConversationID($data);
         if (!$originatorConversationId) {
-            Log::warning("Cannot process callback: missing OriginatorConversationID");            
+            Log::warning("Cannot process callback: missing OriginatorConversationID");
             return;
         }
 
         $transaction = MpesaB2CTransaction::where('originator_conversation_id', $originatorConversationId)
             ->first();
-        
+
         if (!$transaction) {
             Log::warning('M-Pesa B2C transaction not found', $data);
 
@@ -348,7 +426,7 @@ class MpesaController extends Controller
             Log::info('Duplicate callback received for transaction: ' . $transaction->originator_conversation_id);
             return;
         }
-        
+
         // Update transaction details
         $transaction->update([
             'conversation_id' => $data['ConversationID'] ?? null,
@@ -357,7 +435,7 @@ class MpesaController extends Controller
             'status' => ($data['ResultCode'] ?? 1) == 0 ? 'completed' : 'failed',
             'result_data' => $data,
         ]);
-        
+
         // Process additional business logic based on the result
         if (($data['ResultCode'] ?? 1) == 0) {
             // Payment was successful - trigger any necessary business logic
@@ -406,5 +484,4 @@ class MpesaController extends Controller
         Log::warning("OriginatorConversationID not found in callback data: " . json_encode($data));
         return null;
     }
-
 }
